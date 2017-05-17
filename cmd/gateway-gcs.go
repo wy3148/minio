@@ -17,15 +17,18 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"path"
 	"strconv"
 	"strings"
 
+	"encoding/base64"
 	"encoding/hex"
 
 	"cloud.google.com/go/storage"
@@ -219,10 +222,13 @@ func (l *gcsGateway) MakeBucket(bucket string) error {
 func (l *gcsGateway) MakeBucketWithLocation(bucket, location string) error {
 	bkt := l.client.Bucket(bucket)
 
-	// TODO: location
-	_ = location
+	// we'll default to the us multi-region in case of us-east-1
+	if location == "us-east-1" {
+		location = "us"
+	}
+
 	if err := bkt.Create(l.ctx, l.projectID, &storage.BucketAttrs{
-		Location: "US",
+		Location: location,
 	}); err != nil {
 		return gcsToObjectError(traceError(err), bucket)
 	}
@@ -277,6 +283,24 @@ func (l *gcsGateway) DeleteBucket(bucket string) error {
 	return nil
 }
 
+func toGCSPageToken(name string) string {
+	length := uint16(len(name))
+
+	b := []byte{
+		0xa,
+		byte(length & 0xFF),
+	}
+
+	length = length >> 7
+	if length > 0 {
+		b = append(b, byte(length&0xFF))
+	}
+
+	b = append(b, []byte(name)...)
+
+	return base64.StdEncoding.EncodeToString(b)
+}
+
 // ListObjects - lists all blobs in GCS bucket filtered by prefix
 func (l *gcsGateway) ListObjects(bucket string, prefix string, marker string, delimiter string, maxKeys int) (ListObjectsInfo, error) {
 	it := l.client.Bucket(bucket).Objects(l.ctx, &storage.Query{Delimiter: delimiter, Prefix: prefix, Versions: false})
@@ -284,6 +308,10 @@ func (l *gcsGateway) ListObjects(bucket string, prefix string, marker string, de
 	isTruncated := false
 	nextMarker := ""
 	prefixes := []string{}
+
+	// we'll set marker to continue
+	it.PageInfo().Token = marker
+	it.PageInfo().MaxSize = maxKeys
 
 	objects := []ObjectInfo{}
 	for {
@@ -293,8 +321,6 @@ func (l *gcsGateway) ListObjects(bucket string, prefix string, marker string, de
 			// metadata folder, then just break
 			// otherwise we've truncated the output
 
-			m := it.PageInfo().Token
-
 			attrs, _ := it.Next()
 			if attrs == nil {
 			} else if attrs.Prefix == ZZZZMinioPrefix {
@@ -302,18 +328,17 @@ func (l *gcsGateway) ListObjects(bucket string, prefix string, marker string, de
 			}
 
 			isTruncated = true
-			nextMarker = m
 			break
 		}
 
 		attrs, err := it.Next()
 		if err == iterator.Done {
 			break
-		}
-
-		if err != nil {
+		} else if err != nil {
 			return ListObjectsInfo{}, gcsToObjectError(traceError(err), bucket, prefix)
 		}
+
+		nextMarker = toGCSPageToken(attrs.Name)
 
 		if attrs.Prefix == ZZZZMinioPrefix {
 			// we don't return our metadata prefix
@@ -451,17 +476,18 @@ func (l *gcsGateway) PutObject(bucket string, key string, size int64, data io.Re
 		return ObjectInfo{}, gcsToObjectError(traceError(err), bucket)
 	}
 
-	var sha256Writer hash.Hash
-
 	teeReader := data
+
+	var sha256Writer hash.Hash
 	if sha256sum == "" {
 	} else if _, err := hex.DecodeString(sha256sum); err != nil {
 		return ObjectInfo{}, gcsToObjectError(traceError(err), bucket, key)
 	} else {
 		sha256Writer = sha256.New()
-		teeReader = io.TeeReader(data, sha256Writer)
+		teeReader = io.TeeReader(teeReader, sha256Writer)
 	}
 
+	md5sum := metadata["md5Sum"]
 	delete(metadata, "md5Sum")
 
 	object := l.client.Bucket(bucket).Object(key)
@@ -486,12 +512,18 @@ func (l *gcsGateway) PutObject(bucket string, key string, size int64, data io.Re
 	if err != nil {
 		return ObjectInfo{}, gcsToObjectError(traceError(err), bucket, key)
 	}
-	if sha256sum != "" {
-		newSHA256sum := hex.EncodeToString(sha256Writer.Sum(nil))
-		if newSHA256sum != sha256sum {
-			//l.Client.RemoveObject(bucket, object)
-			return ObjectInfo{}, traceError(SHA256Mismatch{})
-		}
+
+	if sha256sum == "" {
+	} else if newSHA256sum := hex.EncodeToString(sha256Writer.Sum(nil)); newSHA256sum != sha256sum {
+		object.Delete(l.ctx)
+		return ObjectInfo{}, traceError(SHA256Mismatch{})
+	}
+
+	if md5sum == "" {
+	} else if b, err := hex.DecodeString(md5sum); err != nil {
+	} else if bytes.Compare(b, attrs.MD5) != 0 {
+		object.Delete(l.ctx)
+		return ObjectInfo{}, traceError(SignatureDoesNotMatch{})
 	}
 
 	return fromGCSObjectInfo(attrs), nil
@@ -522,18 +554,18 @@ func (l *gcsGateway) DeleteObject(bucket string, object string) error {
 
 // ListMultipartUploads - lists all multipart uploads.
 func (l *gcsGateway) ListMultipartUploads(bucket string, prefix string, keyMarker string, uploadIDMarker string, delimiter string, maxUploads int) (ListMultipartsInfo, error) {
-	// TODO: implement prefix and prefixes, how does this work for Multiparts??
-	prefix = fmt.Sprintf("%s/multipart-", ZZZZMinioPrefix)
+	prefix = pathJoin(ZZZZMinioPrefix, "multipart-")
 
 	it := l.client.Bucket(bucket).Objects(l.ctx, &storage.Query{Delimiter: delimiter, Prefix: prefix, Versions: false})
 
-	isTruncated := false
-	// prefixes := []string{}
 	nextMarker := ""
+	isTruncated := false
+
+	it.PageInfo().Token = uploadIDMarker
 
 	uploads := []uploadMetadata{}
 	for {
-		if maxUploads <= len(uploads) {
+		if len(uploads) >= maxUploads {
 			isTruncated = true
 			nextMarker = it.PageInfo().Token
 			break
@@ -542,9 +574,7 @@ func (l *gcsGateway) ListMultipartUploads(bucket string, prefix string, keyMarke
 		attrs, err := it.Next()
 		if err == iterator.Done {
 			break
-		}
-
-		if err != nil {
+		} else if err != nil {
 			return ListMultipartsInfo{}, gcsToObjectError(traceError(err), bucket)
 		}
 
@@ -558,6 +588,8 @@ func (l *gcsGateway) ListMultipartUploads(bucket string, prefix string, keyMarke
 		} else if partID != 0 {
 			continue
 		}
+
+		nextMarker = toGCSPageToken(attrs.Name)
 
 		// we count only partID == 0
 		uploads = append(uploads, uploadMetadata{
@@ -582,6 +614,9 @@ func (l *gcsGateway) ListMultipartUploads(bucket string, prefix string, keyMarke
 }
 
 func fromGCSMultipartKey(s string) (key, uploadID string, partID int, err error) {
+	// remove prefixes
+	s = path.Base(s)
+
 	parts := strings.Split(s, "-")
 	if parts[0] != "multipart" {
 		return "", "", 0, ErrNotValidMultipartIdentifier
@@ -591,8 +626,9 @@ func fromGCSMultipartKey(s string) (key, uploadID string, partID int, err error)
 		return "", "", 0, ErrNotValidMultipartIdentifier
 	}
 
-	key = parts[1]
-	uploadID = parts[3]
+	key = unescape(parts[1])
+
+	uploadID = parts[2]
 
 	partID, err = strconv.Atoi(parts[3])
 	if err != nil {
@@ -602,18 +638,32 @@ func fromGCSMultipartKey(s string) (key, uploadID string, partID int, err error)
 	return
 }
 
-func toGCSMultipartKey(key string, uploadID string, partID int) string {
-	// we don't use the etag within the key, because the amazon spec
-	// explicitly notes that uploaded parts with same number are being overwritten
+func unescape(s string) string {
+	s = strings.Replace(s, "%2D", "-", -1)
+	s = strings.Replace(s, "%2F", "/", -1)
+	s = strings.Replace(s, "%25", "%", -1)
+	return s
+}
 
+func escape(s string) string {
+	s = strings.Replace(s, "%", "%25", -1)
+	s = strings.Replace(s, "/", "%2F", -1)
+	s = strings.Replace(s, "-", "%2D", -1)
+	return s
+}
+
+func toGCSMultipartKey(key string, uploadID string, partID int) string {
 	// parts are allowed to be numbered from 1 to 10,000 (inclusive)
-	return fmt.Sprintf("%s/multipart-%s-%s-%05d", ZZZZMinioPrefix, key, uploadID, partID)
+
+	// we need to encode the key because of possible slashes
+	return pathJoin(ZZZZMinioPrefix, fmt.Sprintf("multipart-%s-%s-%05d", escape(key), uploadID, partID))
 }
 
 // NewMultipartUpload - upload object in multiple parts
 func (l *gcsGateway) NewMultipartUpload(bucket string, key string, metadata map[string]string) (uploadID string, err error) {
 	// generate new uploadid
 	uploadID = mustGetUUID()
+	uploadID = strings.Replace(uploadID, "-", "", -1)
 
 	// generate name for part zero
 	partZeroKey := toGCSMultipartKey(key, uploadID, 0)
@@ -650,29 +700,29 @@ func (l *gcsGateway) PutObjectPart(bucket string, key string, uploadID string, p
 
 // ListObjectParts returns all object parts for specified object in specified bucket
 func (l *gcsGateway) ListObjectParts(bucket string, key string, uploadID string, partNumberMarker int, maxParts int) (ListPartsInfo, error) {
-	// TODO: support partNumberMarker
-
-	prefix := fmt.Sprintf("%s/multipart-%s-%s", ZZZZMinioPrefix, key, uploadID)
-	delimiter := "/"
+	delimiter := slashSeparator
+	prefix := pathJoin(ZZZZMinioPrefix, fmt.Sprintf("multipart-%s-%s", escape(key), uploadID))
 
 	it := l.client.Bucket(bucket).Objects(l.ctx, &storage.Query{Delimiter: delimiter, Prefix: prefix, Versions: false})
 
 	isTruncated := false
 
+	it.PageInfo().Token = toGCSPageToken(toGCSMultipartKey(key, uploadID, partNumberMarker))
+	it.PageInfo().MaxSize = maxParts
+
+	nextPartnumberMarker := 0
+
 	parts := []PartInfo{}
 	for {
-		if maxParts <= len(parts) {
+		if len(parts) >= maxParts {
 			isTruncated = true
-			// nextMarker = it.PageInfo().Token
 			break
 		}
 
 		attrs, err := it.Next()
 		if err == iterator.Done {
 			break
-		}
-
-		if err != nil {
+		} else if err != nil {
 			return ListPartsInfo{}, gcsToObjectError(traceError(err), bucket, prefix)
 		}
 
@@ -689,6 +739,8 @@ func (l *gcsGateway) ListObjectParts(bucket string, key string, uploadID string,
 			continue
 		}
 
+		nextPartnumberMarker = partID
+
 		parts = append(parts, PartInfo{
 			PartNumber:   partID,
 			LastModified: attrs.Updated,
@@ -698,34 +750,36 @@ func (l *gcsGateway) ListObjectParts(bucket string, key string, uploadID string,
 	}
 
 	return ListPartsInfo{
-		IsTruncated: isTruncated,
-		Parts:       parts,
+		IsTruncated:          isTruncated,
+		NextPartNumberMarker: nextPartnumberMarker,
+		Parts:                parts,
 	}, nil
 }
 
 // AbortMultipartUpload aborts a ongoing multipart upload
 func (l *gcsGateway) AbortMultipartUpload(bucket string, key string, uploadID string) error {
-	prefix := fmt.Sprintf("%s/multipart-%s-%s", ZZZZMinioPrefix, key, uploadID)
-	delimiter := "/"
-
-	// delete part zero, ignoring errors here, we want to clean up all remains
-	_ = l.client.Bucket(bucket).Object(toGCSMultipartKey(key, uploadID, 0)).Delete(l.ctx)
+	delimiter := slashSeparator
+	prefix := pathJoin(ZZZZMinioPrefix, fmt.Sprintf("multipart-%s-%s", escape(key), uploadID))
 
 	// iterate through all parts and delete them
 	it := l.client.Bucket(bucket).Objects(l.ctx, &storage.Query{Delimiter: delimiter, Prefix: prefix, Versions: false})
+
+	it.PageInfo().Token = toGCSPageToken(toGCSMultipartKey(key, uploadID, 0))
+
 	for {
 		attrs, err := it.Next()
 		if err == iterator.Done {
 			break
-		}
-
-		if err != nil {
-			return gcsToObjectError(traceError(err), bucket, prefix)
+		} else if err != nil {
+			return gcsToObjectError(traceError(err), bucket, key)
 		}
 
 		// on error continue deleting other parts
 		l.client.Bucket(bucket).Object(attrs.Name).Delete(l.ctx)
 	}
+
+	// delete part zero, ignoring errors here, we want to clean up all remains
+	_ = l.client.Bucket(bucket).Object(toGCSMultipartKey(key, uploadID, 0)).Delete(l.ctx)
 
 	return nil
 }
@@ -747,8 +801,16 @@ func (l *gcsGateway) CompleteMultipartUpload(bucket string, key string, uploadID
 
 	parts := make([]*storage.ObjectHandle, len(uploadedParts))
 	for i, uploadedPart := range uploadedParts {
-		// TODO: verify attrs / ETag
-		parts[i] = l.client.Bucket(bucket).Object(toGCSMultipartKey(key, uploadID, uploadedPart.PartNumber))
+		object := l.client.Bucket(bucket).Object(toGCSMultipartKey(key, uploadID, uploadedPart.PartNumber))
+
+		if etag, partErr := hex.DecodeString(uploadedPart.ETag); partErr != nil {
+		} else if attrs, partErr := object.Attrs(l.ctx); partErr != nil {
+			return ObjectInfo{}, gcsToObjectError(traceError(partErr), bucket, key)
+		} else if bytes.Compare(attrs.MD5, etag) != 0 {
+			return ObjectInfo{}, gcsToObjectError(traceError(InvalidPart{}), bucket, key)
+		}
+
+		parts[i] = object
 	}
 
 	if len(parts) > 32 {
@@ -756,7 +818,7 @@ func (l *gcsGateway) CompleteMultipartUpload(bucket string, key string, uploadID
 		// into subcomposes. This means that the first 32 parts will
 		// compose to a composed-object-0, next parts to composed-object-1,
 		// the final compose will compose composed-object* to 1.
-		return ObjectInfo{}, NotSupported{}
+		return ObjectInfo{}, traceError(NotSupported{})
 	}
 
 	dst := l.client.Bucket(bucket).Object(key)

@@ -65,6 +65,12 @@ func (api gatewayAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Re
 			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
+	case authTypeAnonymous:
+		// No verification needed for anonymous requests.
+	default:
+		// For all unknown auth types return error.
+		writeErrorResponse(w, ErrAccessDenied, r.URL)
+		return
 	}
 
 	getObjectInfo := objectAPI.GetObjectInfo
@@ -232,8 +238,6 @@ func (api gatewayAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Re
 	// Make sure we hex encode md5sum here.
 	metadata["md5Sum"] = hex.EncodeToString(md5Bytes)
 
-	sha256sum := ""
-
 	// Lock the object.
 	objectLock := globalNSMutex.NewNSLock(bucket, object)
 	objectLock.Lock()
@@ -241,13 +245,9 @@ func (api gatewayAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Re
 
 	var objInfo ObjectInfo
 	switch reqAuthType {
-	default:
-		// For all unknown auth types return error.
-		writeErrorResponse(w, ErrAccessDenied, r.URL)
-		return
 	case authTypeAnonymous:
 		// Create anonymous object.
-		objInfo, err = objectAPI.AnonPutObject(bucket, object, size, r.Body, metadata, sha256sum)
+		objInfo, err = objectAPI.AnonPutObject(bucket, object, size, r.Body, metadata, "")
 	case authTypeStreamingSigned:
 		// Initialize stream signature verifier.
 		reader, s3Error := newSignV4ChunkedReader(r)
@@ -256,7 +256,7 @@ func (api gatewayAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Re
 			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
-		objInfo, err = objectAPI.PutObject(bucket, object, size, reader, metadata, sha256sum)
+		objInfo, err = objectAPI.PutObject(bucket, object, size, reader, metadata, "")
 	case authTypeSignedV2, authTypePresignedV2:
 		s3Error := isReqAuthenticatedV2(r)
 		if s3Error != ErrNone {
@@ -264,18 +264,25 @@ func (api gatewayAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Re
 			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
-		objInfo, err = objectAPI.PutObject(bucket, object, size, r.Body, metadata, sha256sum)
+		objInfo, err = objectAPI.PutObject(bucket, object, size, r.Body, metadata, "")
 	case authTypePresigned, authTypeSigned:
 		if s3Error := reqSignatureV4Verify(r, serverConfig.GetRegion()); s3Error != ErrNone {
 			errorIf(errSignatureMismatch, dumpRequest(r))
 			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
+
+		sha256sum := ""
 		if !skipContentSha256Cksum(r) {
-			sha256sum = r.Header.Get("X-Amz-Content-Sha256")
+			sha256sum = getContentSha256Cksum(r)
 		}
+
 		// Create object.
 		objInfo, err = objectAPI.PutObject(bucket, object, size, r.Body, metadata, sha256sum)
+	default:
+		// For all unknown auth types return error.
+		writeErrorResponse(w, ErrAccessDenied, r.URL)
+		return
 	}
 
 	if err != nil {
@@ -322,6 +329,12 @@ func (api gatewayAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.R
 			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
+	case authTypeAnonymous:
+		// No verification needed for anonymous requests.
+	default:
+		// For all unknown auth types return error.
+		writeErrorResponse(w, ErrAccessDenied, r.URL)
+		return
 	}
 
 	getObjectInfo := objectAPI.GetObjectInfo
@@ -645,7 +658,7 @@ func (api gatewayAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Re
 	// reads body which has been read already. So only validating
 	// region here.
 	serverRegion := serverConfig.GetRegion()
-	if serverRegion != location {
+	if serverRegion != "" && serverRegion != location {
 		writeErrorResponse(w, ErrInvalidRegion, r.URL)
 		return
 	}
@@ -730,6 +743,12 @@ func (api gatewayAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *htt
 			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
+	case authTypeAnonymous:
+		// No verification needed for anonymous requests.
+	default:
+		// For all unknown auth types return error.
+		writeErrorResponse(w, ErrAccessDenied, r.URL)
+		return
 	}
 
 	// Extract all the litsObjectsV1 query params to their native values.
@@ -794,6 +813,12 @@ func (api gatewayAPIHandlers) HeadBucketHandler(w http.ResponseWriter, r *http.R
 			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
+	case authTypeAnonymous:
+		// No verification needed for anonymous requests.
+	default:
+		// For all unknown auth types return error.
+		writeErrorResponse(w, ErrAccessDenied, r.URL)
+		return
 	}
 
 	getBucketInfo := objectAPI.GetBucketInfo
@@ -844,6 +869,12 @@ func (api gatewayAPIHandlers) GetBucketLocationHandler(w http.ResponseWriter, r 
 			writeErrorResponse(w, s3Error, r.URL)
 			return
 		}
+	case authTypeAnonymous:
+		// No verification needed for anonymous requests.
+	default:
+		// For all unknown auth types return error.
+		writeErrorResponse(w, ErrAccessDenied, r.URL)
+		return
 	}
 
 	getBucketInfo := objectAPI.GetBucketInfo
